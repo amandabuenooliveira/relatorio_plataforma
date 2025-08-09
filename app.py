@@ -73,6 +73,9 @@ def sanitize_and_consolidate(df):
     sum_cols = [c for c in CANAL_COLS + ["Total"] if c in df.columns]
     g = df.groupby(["Motivo", "MÊSANO"], dropna=False)[sum_cols].sum(min_count=1).reset_index()
 
+    # 🔹 Garante que MÊSANO é datetime
+    g["MÊSANO"] = pd.to_datetime(g["MÊSANO"], errors="coerce")
+
     g["ANO"] = g["MÊSANO"].dt.year
     g["TRIMESTRE"] = g["MÊSANO"].dt.quarter.astype(str) + "TRI" + (g["MÊSANO"].dt.year % 100).astype(str).str.zfill(2)
 
