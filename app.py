@@ -12,7 +12,10 @@ ALL_STD = ["Motivo", "MÊSANO", "ANO", "TRIMESTRE"] + CANAL_COLS_STD + ["Total"]
 # Mapeamento de aliases -> nome padrão
 ALIASES = {
     "Motivo": ["Motivo", "Assunto", "Categoria"],
-    "MÊSANO": ["MÊSANO", "MESANO", "MesAno", "MÊS/ANO", "MES/ANO", "MÊS-ANO", "MES-ANO", "MÊS_ANO", "MES_ANO", "MÊS ANO", "MES ANO"],
+    "MÊSANO": [
+        "MÊSANO", "MESANO", "MesAno", "MÊS/ANO", "MES/ANO", "MÊS-ANO", "MES-ANO",
+        "MÊS_ANO", "MES_ANO", "MÊS ANO", "MES ANO", "MÊSANO "
+    ],
     "E-mail": ["E-mail", "Email", "E_mail", "E mail"],
     ".0300": [".0300", "0300"],
     "WhatsApp": ["WhatsApp", "Whatsapp", "WHATSAPP", "WHATS", "Whats"],
@@ -21,6 +24,9 @@ ALIASES = {
     "Total": ["Total", "TOTAL", "Qtd", "Quantidade"]
 }
 
+# -------------------
+# Normalização de colunas
+# -------------------
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     cols = [str(c).strip() for c in df.columns]
     rename_map = {}
@@ -36,45 +42,91 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
             df = df.drop(columns=c)
     return df
 
+# -------------------
+# Parser robusto de MÊSANO
+# -------------------
 def parse_mesano_to_datetime(s):
+    """Converte vários formatos (data completa, 07-24, 07/24, jul/25, JULHO 2025, etc.) para primeiro dia do mês."""
     if pd.isna(s):
         return pd.NaT
-    # tenta parse direto
+
+    # 1) tenta parse direto de datas (inclui strings tipo '2025-07-01' etc.)
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     if not pd.isna(dt):
         return pd.Timestamp(dt.year, dt.month, 1)
-    # tenta formato 'jul/25' em PT-BR
-    mapa = {"jan":1,"fev":2,"mar":3,"abr":4,"mai":5,"jun":6,"jul":7,"ago":8,"set":9,"out":10,"nov":11,"dez":12}
-    try:
-        s2 = str(s).strip().lower()
-        if "/" in s2:
-            mm_str, yy = s2.split("/")
-            mm = mapa.get(mm_str[:3])
-            yy = int(yy)
+
+    # 2) tenta formatos com mês em PT-BR (abreviado e por extenso) + ano (2 ou 4 dígitos)
+    mapa = {
+        "jan": 1, "janeiro": 1,
+        "fev": 2, "fevereiro": 2,
+        "mar": 3, "março": 3, "marco": 3,
+        "abr": 4, "abril": 4,
+        "mai": 5, "maio": 5,
+        "jun": 6, "junho": 6,
+        "jul": 7, "julho": 7,
+        "ago": 8, "agosto": 8,
+        "set": 9, "setembro": 9,
+        "out": 10, "outubro": 10,
+        "nov": 11, "novembro": 11,
+        "dez": 12, "dezembro": 12
+    }
+
+    s2 = str(s).strip().lower()
+    # normaliza separadores em espaço
+    s2 = s2.replace("-", " ").replace("/", " ").replace("\\", " ")
+    parts = [p for p in s2.split() if p]
+
+    # Casos comuns: ["jul", "25"] | ["julho", "2025"] | ["07", "24"]
+    if len(parts) >= 2:
+        mm_raw, yy_raw = parts[0], parts[1]
+
+        # tenta mês numérico
+        mm = None
+        if mm_raw.isdigit():
+            try:
+                mm_num = int(mm_raw)
+                if 1 <= mm_num <= 12:
+                    mm = mm_num
+            except ValueError:
+                mm = None
+
+        # se não for numérico, tenta mapa (abreviação ou por extenso)
+        if mm is None:
+            mm = mapa.get(mm_raw[:3]) or mapa.get(mm_raw)
+
+        # ano
+        try:
+            yy = int(yy_raw)
             yy = 2000 + yy if yy < 100 else yy
-            if mm:
+        except ValueError:
+            yy = None
+
+        if mm and yy:
+            try:
                 return pd.Timestamp(yy, mm, 1)
-    except Exception:
-        pass
+            except Exception:
+                pass
+
     return pd.NaT
 
 def ensure_mesano_datetime(df: pd.DataFrame) -> pd.DataFrame:
     if "MÊSANO" not in df.columns:
-        raise ValueError("Coluna 'MÊSANO' não encontrada (tente conferir o cabeçalho).")
+        raise ValueError("Coluna 'MÊSANO' não encontrada (confira o cabeçalho).")
     df["MÊSANO"] = df["MÊSANO"].apply(parse_mesano_to_datetime)
     return df
 
+# -------------------
+# Leitura de arquivos (XLSX ou CSV)
+# -------------------
 def read_excel_auto(io):
     """Lê Excel: tenta aba 'EBSA'; senão escolhe a maior não vazia."""
     try:
         return pd.read_excel(io, sheet_name="EBSA")
     except Exception:
         sheets = pd.read_excel(io, sheet_name=None)
-        # pega a maior não vazia; se todas vazias, pega a primeira
         non_empty = [d for d in sheets.values() if not d.empty]
         if non_empty:
             return max(non_empty, key=lambda d: d.shape[0] * d.shape[1])
-        # fallback
         return list(sheets.values())[0]
 
 def read_any_table(io):
@@ -118,6 +170,9 @@ def load_data(uploaded_file=None):
     st.warning("⚠️ Nenhuma base local encontrada. Faça upload do arquivo (XLSX/CSV) na barra lateral.")
     return pd.DataFrame(columns=ALL_STD)
 
+# -------------------
+# Consolidação e cálculos
+# -------------------
 def sanitize_and_consolidate(df):
     """Converte numéricos, consolida duplicados por Motivo+MÊSANO, recalcula ANO/TRI e Total."""
     if df.empty:
@@ -139,7 +194,7 @@ def sanitize_and_consolidate(df):
     # assegura datetime pós-agrupamento
     g["MÊSANO"] = pd.to_datetime(g["MÊSANO"], errors="coerce")
     if g["MÊSANO"].isna().all():
-        raise ValueError("Falha ao converter 'MÊSANO' para data. Verifique o formato (ex.: 07-24, jul/25).")
+        raise ValueError("Falha ao converter 'MÊSANO' para data. Exemplos aceitos: 07-24, 07/24, jul/25, JULHO 2025.")
 
     # ANO/TRI
     g["ANO"] = g["MÊSANO"].dt.year
