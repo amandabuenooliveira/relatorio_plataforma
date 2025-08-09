@@ -2,6 +2,7 @@ from pathlib import Path
 import streamlit as st
 import pandas as pd
 import numpy as np
+import altair as alt
 
 st.set_page_config(page_title="Acompanhamento de Atendimentos - EBSA", layout="wide")
 
@@ -160,7 +161,6 @@ def load_data(uploaded_file=None):
         "Relatorio_EBSA_Acumulado.xlsx",
         "Relatorio_EBSA.csv",
         "Relatório_EBSA.csv",
-
     ]
     for fn in candidates:
         p = Path(fn)
@@ -197,9 +197,14 @@ def sanitize_and_consolidate(df):
     if g["MÊSANO"].isna().all():
         raise ValueError("Falha ao converter 'MÊSANO' para data. Exemplos aceitos: 07-24, 07/24, jul/25, JULHO 2025.")
 
-    # ANO/TRI
-    g["ANO"] = g["MÊSANO"].dt.year
-    g["TRIMESTRE"] = g["MÊSANO"].dt.quarter.astype(str) + "TRI" + (g["MÊSANO"].dt.year % 100).astype(str).str.zfill(2)
+    # >>>>>>> AJUSTE: ANO como inteiro e TRIMESTRE sem NaN
+    g["ANO"] = g["MÊSANO"].dt.year.astype("Int64")  # inteiro, preserva nulos
+    g["TRIMESTRE"] = g.apply(
+        lambda row: f"{row['MÊSANO'].quarter}TRI{str(row['MÊSANO'].year % 100).zfill(2)}"
+        if pd.notna(row["MÊSANO"]) else pd.NA,
+        axis=1
+    )
+    # <<<<<<<<
 
     # Total (se ausente ou nulo)
     canais_presentes = [c for c in CANAL_COLS_STD if c in g.columns]
@@ -250,10 +255,10 @@ with st.sidebar:
     canais_disponiveis = [c for c in CANAL_COLS_STD if c in df.columns]
     sel_canais = st.multiselect("Canais", canais_disponiveis, default=canais_disponiveis)
 
-    anos = sorted(df["ANO"].dropna().unique())
+    anos = sorted([int(a) for a in df["ANO"].dropna().unique().tolist()])
     sel_anos = st.multiselect("Ano", anos, default=anos)
 
-    tris = sorted(df["TRIMESTRE"].dropna().unique())
+    tris = sorted([t for t in df["TRIMESTRE"].dropna().unique().tolist()])
     sel_tris = st.multiselect("Trimestre", tris, default=tris)
 
 # Filtros
@@ -277,20 +282,92 @@ with col1:
 with col2:
     st.metric("Registros filtrados", f"{len(flt):,}".replace(",", "."))
 
+# 1) Tendência Mensal Total
 st.subheader("Tendência Mensal (Total)")
 serie = flt.groupby("MÊSANO", as_index=False)["Total"].sum().sort_values("MÊSANO")
 st.line_chart(serie.set_index("MÊSANO")["Total"])
 
-st.subheader("Atendimentos por Canal")
+# 2) Área empilhada por Canal (evolução)
+st.subheader("Evolução por Canal (Área Empilhada)")
 if sel_canais:
-    por_canal = flt[sel_canais].sum().sort_values(ascending=False)
-    st.bar_chart(por_canal)
+    area_df = flt.groupby("MÊSANO", as_index=False)[sel_canais].sum().sort_values("MÊSANO")
+    area_df = area_df.set_index("MÊSANO")
+    st.area_chart(area_df)
 
-st.subheader("Top Motivos")
+# 3) Heatmap Motivo x Mês
+st.subheader("Heatmap — Motivo x Mês")
+if not flt.empty:
+    heat = (flt.assign(Mes=flt["MÊSANO"].dt.strftime("%Y-%m"))
+                .groupby(["Motivo", "Mes"], as_index=False)["Total"].sum())
+    heat_chart = (
+        alt.Chart(heat)
+        .mark_rect()
+        .encode(
+            x=alt.X("Mes:N", sort="ascending", title="Mês"),
+            y=alt.Y("Motivo:N", title="Motivo"),
+            color=alt.Color("Total:Q", title="Total"),
+            tooltip=["Motivo", "Mes", "Total"]
+        )
+        .properties(height=400)
+    )
+    st.altair_chart(heat_chart, use_container_width=True)
+else:
+    st.info("Sem dados para gerar o heatmap no filtro atual.")
+
+# 4) Pareto de Motivos (80/20)
+st.subheader("Pareto — Motivos (acumulado no período filtrado)")
+if "Total" in flt.columns and not flt.empty:
+    pareto = (flt.groupby("Motivo", as_index=False)["Total"].sum()
+                .sort_values("Total", ascending=False))
+    pareto["% Acum."] = (pareto["Total"].cumsum() / pareto["Total"].sum() * 100).round(1)
+    bars = alt.Chart(pareto).mark_bar().encode(
+        x=alt.X("Motivo:N", sort="-y", title="Motivo"),
+        y=alt.Y("Total:Q", title="Total")
+    )
+    line = alt.Chart(pareto).mark_line(point=True).encode(
+        x=alt.X("Motivo:N", sort="-y"),
+        y=alt.Y("% Acum.:Q", axis=alt.Axis(title="% Acumulado", format="~s")),
+    )
+    st.altair_chart(bars + line, use_container_width=True)
+else:
+    st.info("Sem dados para Pareto no filtro atual.")
+
+# 5) Movers — maiores variações mês contra mês por Motivo
+st.subheader("Variação M/M — Maiores altas e quedas por Motivo")
+if not flt.empty:
+    mm = (flt.groupby(["Motivo", "MÊSANO"], as_index=False)["Total"].sum()
+              .sort_values(["Motivo", "MÊSANO"]))
+    # pega último mês disponível no filtro e o anterior
+    meses_ord = sorted(mm["MÊSANO"].unique())
+    if len(meses_ord) >= 2:
+        last, prev = meses_ord[-1], meses_ord[-2]
+        base = mm[mm["MÊSANO"].isin([prev, last])].pivot(index="Motivo", columns="MÊSANO", values="Total").fillna(0)
+        base["Δ"] = base.get(last, 0) - base.get(prev, 0)
+        # evita divisão por zero
+        base["%"] = np.where(base.get(prev, 0) == 0, np.nan, (base["Δ"] / base.get(prev, 0) * 100))
+        up = base.sort_values("Δ", ascending=False).head(10)[["Δ", "%"]].rename(columns={"Δ":"Δ Absoluto", "%":"Δ %"})
+        down = base.sort_values("Δ", ascending=True).head(10)[["Δ", "%"]].rename(columns={"Δ":"Δ Absoluto", "%":"Δ %"})
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption(f"Maiores altas — {prev.date()} → {last.date()}")
+            st.dataframe(up.style.format({"Δ Absoluto": "{:,.0f}", "Δ %": "{:+.1f}%"}), use_container_width=True)
+        with c2:
+            st.caption(f"Maiores quedas — {prev.date()} → {last.date()}")
+            st.dataframe(down.style.format({"Δ Absoluto": "{:,.0f}", "Δ %": "{:+.1f}%"}), use_container_width=True)
+    else:
+        st.info("Precisamos de ao menos dois meses no filtro para calcular variação M/M.")
+else:
+    st.info("Sem dados para calcular variação M/M no filtro atual.")
+
+# 6) Top Motivos (barras simples)
+st.subheader("Top Motivos (Total no período)")
 top_mot = flt.groupby("Motivo", as_index=False)["Total"].sum().sort_values("Total", ascending=False).head(10)
 if not top_mot.empty:
     st.bar_chart(top_mot.set_index("Motivo")["Total"])
+else:
+    st.info("Sem dados para os filtros atuais.")
 
+# 7) Detalhe + download
 st.subheader("Detalhe dos Registros")
 st.dataframe(flt.sort_values(["MÊSANO", "Motivo"]), use_container_width=True)
 st.download_button(
