@@ -160,6 +160,7 @@ def load_data(uploaded_file=None):
         "Relatorio_EBSA_Acumulado.xlsx",
         "Relatorio_EBSA.csv",
         "Relatório_EBSA.csv",
+
     ]
     for fn in candidates:
         p = Path(fn)
