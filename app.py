@@ -1,8 +1,10 @@
 from pathlib import Path
+from io import BytesIO
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
+import requests
 
 st.set_page_config(page_title="Acompanhamento de Atendimentos - EBSA", layout="wide")
 
@@ -51,12 +53,12 @@ def parse_mesano_to_datetime(s):
     if pd.isna(s):
         return pd.NaT
 
-    # 1) tenta parse direto de datas (inclui strings tipo '2025-07-01' etc.)
+    # 1) tenta parse direto de datas
     dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     if not pd.isna(dt):
         return pd.Timestamp(dt.year, dt.month, 1)
 
-    # 2) tenta formatos com mês em PT-BR (abreviado e por extenso) + ano (2 ou 4 dígitos)
+    # 2) PT-BR mês (abreviado/por extenso) + ano
     mapa = {
         "jan": 1, "janeiro": 1,
         "fev": 2, "fevereiro": 2,
@@ -73,15 +75,12 @@ def parse_mesano_to_datetime(s):
     }
 
     s2 = str(s).strip().lower()
-    # normaliza separadores em espaço
     s2 = s2.replace("-", " ").replace("/", " ").replace("\\", " ")
     parts = [p for p in s2.split() if p]
 
-    # Casos comuns: ["jul", "25"] | ["julho", "2025"] | ["07", "24"]
     if len(parts) >= 2:
         mm_raw, yy_raw = parts[0], parts[1]
 
-        # tenta mês numérico
         mm = None
         if mm_raw.isdigit():
             try:
@@ -90,12 +89,9 @@ def parse_mesano_to_datetime(s):
                     mm = mm_num
             except ValueError:
                 mm = None
-
-        # se não for numérico, tenta mapa (abreviação ou por extenso)
         if mm is None:
             mm = mapa.get(mm_raw[:3]) or mapa.get(mm_raw)
 
-        # ano
         try:
             yy = int(yy_raw)
             yy = 2000 + yy if yy < 100 else yy
@@ -117,43 +113,53 @@ def ensure_mesano_datetime(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # -------------------
-# Leitura de arquivos (XLSX ou CSV)
+# Leitura de arquivos (XLSX/CSV + URL secrets)
 # -------------------
-def read_excel_auto(io):
-    """Lê Excel: tenta aba 'EBSA'; senão escolhe a maior não vazia."""
+def read_excel_auto(io, sheet_name=None):
+    """Lê Excel: tenta sheet_name; senão escolhe a maior não vazia."""
+    if sheet_name:
+        try:
+            return pd.read_excel(io, sheet_name=sheet_name)
+        except Exception:
+            pass
     try:
-        return pd.read_excel(io, sheet_name="EBSA")
-    except Exception:
         sheets = pd.read_excel(io, sheet_name=None)
         non_empty = [d for d in sheets.values() if not d.empty]
         if non_empty:
             return max(non_empty, key=lambda d: d.shape[0] * d.shape[1])
         return list(sheets.values())[0]
+    except Exception as e:
+        raise e
 
-def read_any_table(io):
+def read_any_table(io, forced_format=None, sheet_name=None):
     """Lê CSV ou XLSX, normaliza colunas e MÊSANO."""
     name = str(io if isinstance(io, (str, Path)) else getattr(io, "name", "")).lower()
-    if name.endswith(".csv"):
+    fmt = forced_format or ("csv" if name.endswith(".csv") else ("xlsx" if name.endswith((".xlsx", ".xlsm", ".xls")) else None))
+
+    if fmt == "csv":
         df = pd.read_csv(io, sep=None, engine="python", encoding="utf-8-sig")
-    elif name.endswith((".xlsx", ".xlsm", ".xls")):
-        df = read_excel_auto(io)
     else:
-        # tenta Excel por padrão (Streamlit uploader pode não ter extensão)
-        try:
-            df = read_excel_auto(io)
-        except Exception:
-            df = pd.read_csv(io, sep=None, engine="python", encoding="utf-8-sig")
+        # tenta Excel por padrão
+        df = read_excel_auto(io, sheet_name=sheet_name)
+
     df = normalize_columns(df)
     df = ensure_mesano_datetime(df)
     return df
 
+def read_from_url(url: str, forced_format=None, sheet_name=None):
+    resp = requests.get(url, timeout=20)
+    resp.raise_for_status()
+    bio = BytesIO(resp.content)
+    return read_any_table(bio, forced_format=forced_format, sheet_name=sheet_name)
+
 @st.cache_data(show_spinner=False)
 def load_data(uploaded_file=None):
-    """Tenta carregar: 1) upload; 2) arquivo local do repo; se nada, retorna DF vazio."""
+    """Ordem: upload -> arquivo local -> secrets.DATA_URL -> vazio."""
+    # 1) Upload
     if uploaded_file is not None:
         return read_any_table(uploaded_file)
 
-    # tente os nomes mais comuns no repo
+    # 2) Arquivo local (repo)
     candidates = [
         "Relatório_EBSA_Acumulado_Consolidado.xlsx",
         "Relatório_EBSA_Acumulado.xlsx",
@@ -167,8 +173,17 @@ def load_data(uploaded_file=None):
         if p.exists():
             return read_any_table(p)
 
-    # nenhum arquivo local
-    st.warning("⚠️ Nenhuma base local encontrada. Faça upload do arquivo (XLSX/CSV) na barra lateral.")
+    # 3) URL nos secrets
+    url = st.secrets.get("DATA_URL", None)
+    if url:
+        forced_format = st.secrets.get("DATA_FORMAT", None)  # "xlsx" ou "csv"
+        sheet_name = st.secrets.get("SHEET_NAME", None)
+        try:
+            return read_from_url(url, forced_format=forced_format, sheet_name=sheet_name)
+        except Exception as e:
+            st.warning(f"Não foi possível carregar a base via DATA_URL: {e}")
+
+    # 4) Nada encontrado
     return pd.DataFrame(columns=ALL_STD)
 
 # -------------------
@@ -180,7 +195,6 @@ def sanitize_and_consolidate(df):
         return df.copy()
 
     df = df.copy()
-    # garante colunas padrão
     df = normalize_columns(df)
 
     # canais/total para numérico
@@ -197,14 +211,13 @@ def sanitize_and_consolidate(df):
     if g["MÊSANO"].isna().all():
         raise ValueError("Falha ao converter 'MÊSANO' para data. Exemplos aceitos: 07-24, 07/24, jul/25, JULHO 2025.")
 
-    # >>>>>>> AJUSTE: ANO como inteiro e TRIMESTRE sem NaN
-    g["ANO"] = g["MÊSANO"].dt.year.astype("Int64")  # inteiro, preserva nulos
+    # ANO inteiro e TRIMESTRE sem NaN
+    g["ANO"] = g["MÊSANO"].dt.year.astype("Int64")
     g["TRIMESTRE"] = g.apply(
         lambda row: f"{row['MÊSANO'].quarter}TRI{str(row['MÊSANO'].year % 100).zfill(2)}"
         if pd.notna(row["MÊSANO"]) else pd.NA,
         axis=1
     )
-    # <<<<<<<<
 
     # Total (se ausente ou nulo)
     canais_presentes = [c for c in CANAL_COLS_STD if c in g.columns]
@@ -221,6 +234,7 @@ def sanitize_and_consolidate(df):
 with st.sidebar:
     st.header("⚙️ Configurações")
     up = st.file_uploader("Carregue a planilha (XLSX/CSV)", type=["xlsx", "xls", "csv"])
+
     try:
         df_raw = load_data(up)
     except Exception as e:
@@ -228,7 +242,7 @@ with st.sidebar:
         st.stop()
 
     if df_raw.empty:
-        st.info("Carregue um arquivo para visualizar os dados.")
+        st.info("Nenhuma base local/URL encontrada. Faça upload do arquivo (XLSX/CSV) ou configure DATA_URL em Secrets.")
         st.stop()
 
     try:
@@ -337,13 +351,11 @@ st.subheader("Variação M/M — Maiores altas e quedas por Motivo")
 if not flt.empty:
     mm = (flt.groupby(["Motivo", "MÊSANO"], as_index=False)["Total"].sum()
               .sort_values(["Motivo", "MÊSANO"]))
-    # pega último mês disponível no filtro e o anterior
     meses_ord = sorted(mm["MÊSANO"].unique())
     if len(meses_ord) >= 2:
         last, prev = meses_ord[-1], meses_ord[-2]
         base = mm[mm["MÊSANO"].isin([prev, last])].pivot(index="Motivo", columns="MÊSANO", values="Total").fillna(0)
         base["Δ"] = base.get(last, 0) - base.get(prev, 0)
-        # evita divisão por zero
         base["%"] = np.where(base.get(prev, 0) == 0, np.nan, (base["Δ"] / base.get(prev, 0) * 100))
         up = base.sort_values("Δ", ascending=False).head(10)[["Δ", "%"]].rename(columns={"Δ":"Δ Absoluto", "%":"Δ %"})
         down = base.sort_values("Δ", ascending=True).head(10)[["Δ", "%"]].rename(columns={"Δ":"Δ Absoluto", "%":"Δ %"})
